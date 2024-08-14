@@ -1,0 +1,129 @@
+stages:
+  - build
+  - test
+  - deploy
+  - alert
+
+services:
+  - docker:dind 
+
+variables:
+  APP_NAME: codsworth-sample-app
+  APP_PORT: 3000
+  IMAGE: ${DOCKER_USER}/${APP_NAME}
+  PROD_IMAGE: ${DOCKER_USER}/${APP_NAME}:$CI_COMMIT_TAG
+  DOCKER_TLS_CERTDIR: ""
+
+build-job:
+  image: docker:latest
+  stage: build
+  script:
+    - docker build -t ${IMAGE} .
+    - echo ${DOCKER_USER_PASSWD} | docker login -u ${DOCKER_USER} --password-stdin
+    - |
+      if [[ $CI_COMMIT_TAG ]]
+      then
+        echo "Pushing production image..."
+        docker tag ${IMAGE} ${PROD_IMAGE}
+        docker push ${PROD_IMAGE}
+      else
+        echo "Pushing non-prod image..."
+        docker push ${IMAGE}
+      fi
+
+trivy:
+  image: 
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  stage: test
+
+  script:
+    - |
+      if [[ $CI_COMMIT_TAG ]]
+      then
+        echo "Scanning ${PROD_IMAGE} tagged image..."
+        trivy image ${PROD_IMAGE}
+      else
+        echo "Scanning ${IMAGE} image..."
+        trivy image ${IMAGE}
+      fi
+
+snyk:
+  stage: test
+  image: 
+    name: ${IMAGE}
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_TAG == null
+  script:
+    - apk add curl
+    - curl https://static.snyk.io/cli/latest/snyk-linux -o snyk && chmod +x ./snyk
+    - ./snyk auth ${SNYK_TOKEN}
+    - ./snyk test --json > snyk-results.json
+    - if [[ $? -gt 0 ]]; then echo "Application is not secure, check the job artifact to fix these issues."; fi;
+  artifacts:
+    when: always
+    paths:
+    - snyk-results.json
+  allow_failure: true
+
+snyk-production:
+  stage: test
+  image: 
+    name: ${PROD_IMAGE}
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - apk add curl
+    - curl https://static.snyk.io/cli/latest/snyk-linux -o snyk && chmod +x ./snyk
+    - ./snyk auth ${SNYK_TOKEN}
+    - ./snyk test --json > snyk-results.json
+    - if [[ $? -gt 0 ]]; then echo "Application is not secure, check the job artifact to fix these issues."; fi;
+  artifacts:
+    when: always
+    paths:
+    - snyk-results.json
+  allow_failure: true
+
+deploy-job:
+  image: ubuntu:latest
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH 
+    - if: $CI_COMMIT_TAG
+
+  script:
+    - 'echo "Building docker!"'
+    - apt-get update -qq
+    # Setup SSH deploy keys
+    - 'which ssh-agent || ( apt-get install -qq openssh-client )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$SSH_PRIVATE_KEY")
+    - mkdir -p ~/.ssh
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+
+    - |
+      if [[ $(docker ps | grep $APP_NAME) ]]
+      then
+        ssh ${WEB_SERVER} "docker stop ${APP_NAME}"
+      fi
+    - |
+      if [[ $CI_COMMIT_TAG ]]
+      then
+        ssh ${WEB_SERVER} "docker pull ${PROD_IMAGE}"
+        ssh ${WEB_SERVER} "docker run --rm -d --name ${APP_NAME} -p ${APP_PORT}:${APP_PORT} ${PROD_IMAGE}"
+      else
+        ssh ${WEB_SERVER} "docker pull ${IMAGE}"
+        ssh ${WEB_SERVER} "docker run --rm -d --name ${APP_NAME} -p ${APP_PORT}:${APP_PORT} ${IMAGE}"
+      fi
+
+alert:
+  stage: alert
+  image: ubuntu:latest
+  after_script:
+    - chmod +x telegram.sh
+    - ./telegram.sh
+  script:
+    - apt-get update && apt-get install -y curl
+    - echo "send message to telegram!"
